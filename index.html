@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>駅徒歩距離マップ</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  body { display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 12px 16px; background: #f7f7f7; border-bottom: 1px solid #ddd; }
+  h1 { margin: 0 0 8px; font-size: 16px; }
+  h1 a { color: inherit; text-decoration: none; }
+  .controls { display: flex; flex-direction: column; gap: 8px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  textarea { flex: 1; min-width: 280px; min-height: 56px; padding: 8px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; resize: vertical; font-family: inherit; }
+  input[type="number"] { padding: 6px 8px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; width: 80px; }
+  button { padding: 8px 14px; font-size: 14px; background: #1a73e8; color: white; border: none; border-radius: 4px; cursor: pointer; }
+  button:hover { background: #1558b0; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  label { font-size: 13px; color: #444; }
+  #status { font-size: 13px; color: #555; min-height: 18px; }
+  #status.error { color: #d33; }
+  #map { flex: 1; width: 100%; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 13px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 12px; height: 12px; border-radius: 50%; display: inline-block; border: 2px solid; }
+  .popup a { color: #1a73e8; }
+  .station-icon { background: transparent; border: none; }
+  .station-icon div { width: 26px; height: 26px; border-radius: 50%; color: white; font-weight: bold; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 3px rgba(0,0,0,.4); border: 2px solid white; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>駅徒歩距離マップ</h1>
+  <div class="controls">
+    <div class="row">
+      <textarea id="input" placeholder="例: 京成本線「新三河島」駅 徒歩4分／山手線・京浜東北線・千代田線「西日暮里」駅 徒歩14分">京成本線「新三河島」駅 徒歩4分／山手線・京浜東北線・千代田線「西日暮里」駅 徒歩14分</textarea>
+    </div>
+    <div class="row">
+      <label>徒歩速度: <input type="number" id="speed" value="80" min="40" max="120" step="10">m/分</label>
+      <button id="run">表示</button>
+      <span style="font-size:12px;color:#888">地図: OpenStreetMap / ジオコーディング: Photon</span>
+    </div>
+    <div id="status"></div>
+    <div id="legend" class="legend"></div>
+  </div>
+</header>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+(() => {
+  const COLORS = ['#e53935', '#1e88e5', '#43a047', '#fb8c00', '#8e24aa', '#00acc1', '#c0ca33', '#5e35b1'];
+
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status');
+  const legendEl = $('legend');
+
+  let map = null;
+  let layerGroup = null;
+
+  function setStatus(msg, isError = false) {
+    statusEl.textContent = msg;
+    statusEl.classList.toggle('error', isError);
+  }
+
+  function parseInput(text) {
+    const entries = [];
+    const chunks = text.split(/[／/]/).map(s => s.trim()).filter(Boolean);
+    for (const chunk of chunks) {
+      const stationMatch = chunk.match(/[「『]([^」』]+)[」』]/);
+      const minutesMatch = chunk.match(/徒歩\s*(\d+)\s*分/);
+      if (!stationMatch || !minutesMatch) continue;
+      const station = stationMatch[1];
+      const minutes = parseInt(minutesMatch[1], 10);
+      const linesPart = chunk.slice(0, stationMatch.index).trim();
+      entries.push({
+        station,
+        minutes,
+        lines: linesPart || null,
+        label: `${station}駅 徒歩${minutes}分`,
+      });
+    }
+    return entries;
+  }
+
+  // 日本のおおよその中心（バイアス用）
+  const JP_CENTER = { lat: 36.2048, lng: 138.2529 };
+
+  async function geocode(query) {
+    const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=5&lang=default&lat=${JP_CENTER.lat}&lon=${JP_CENTER.lng}`;
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    if (!res.ok) throw new Error(`Photon error: ${res.status}`);
+    const data = await res.json();
+    const features = data.features || [];
+    if (features.length === 0) return null;
+    // 日本国内を優先
+    const jp = features.find(f => f.properties && f.properties.countrycode === 'JP') || features[0];
+    const [lng, lat] = jp.geometry.coordinates;
+    return { lat, lng };
+  }
+
+  async function geocodeStation(entry) {
+    const candidates = [
+      `${entry.station} station`,
+      `${entry.station}駅`,
+      `${entry.station} 駅`,
+      entry.station,
+    ];
+    for (const q of candidates) {
+      try {
+        const loc = await geocode(q);
+        if (loc) return loc;
+      } catch (e) {
+        console.warn(e);
+      }
+    }
+    return null;
+  }
+
+  function ensureMap() {
+    if (map) return;
+    map = L.map('map').setView([35.681236, 139.767125], 14);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    }).addTo(map);
+    layerGroup = L.layerGroup().addTo(map);
+  }
+
+  function clearLayers() {
+    if (layerGroup) layerGroup.clearLayers();
+  }
+
+  function renderLegend(items) {
+    legendEl.innerHTML = '';
+    items.forEach((it, i) => {
+      const color = COLORS[i % COLORS.length];
+      const el = document.createElement('span');
+      el.innerHTML = `<i style="border-color:${color}; background:${color}33"></i>${it.label} (${it.radius}m)`;
+      legendEl.appendChild(el);
+    });
+  }
+
+  function gmapsLink(lat, lng, label) {
+    const q = encodeURIComponent(`${lat},${lng}`);
+    return `https://www.google.com/maps/search/?api=1&query=${q}${label ? `&query_place_id=` : ''}`;
+  }
+
+  async function run() {
+    const text = $('input').value;
+    const speed = parseInt($('speed').value, 10) || 80;
+    const entries = parseInput(text);
+    if (entries.length === 0) {
+      setStatus('駅情報を認識できませんでした。「駅名」徒歩N分 の形式で入力してください', true);
+      return;
+    }
+
+    $('run').disabled = true;
+    try {
+      ensureMap();
+      clearLayers();
+
+      const results = [];
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        setStatus(`駅を検索中... (${i + 1}/${entries.length}) ${entry.station}駅`);
+        const loc = await geocodeStation(entry);
+        if (!loc) throw new Error(`${entry.station}駅 が見つかりませんでした`);
+        results.push({ ...entry, loc, radius: entry.minutes * speed });
+      }
+
+      const bounds = L.latLngBounds([]);
+      results.forEach((r, i) => {
+        const color = COLORS[i % COLORS.length];
+        const circle = L.circle([r.loc.lat, r.loc.lng], {
+          radius: r.radius,
+          color,
+          weight: 2,
+          opacity: 0.9,
+          fillColor: color,
+          fillOpacity: 0.2,
+        }).addTo(layerGroup);
+        bounds.extend(circle.getBounds());
+
+        const icon = L.divIcon({
+          className: 'station-icon',
+          html: `<div style="background:${color}">${i + 1}</div>`,
+          iconSize: [26, 26],
+          iconAnchor: [13, 13],
+        });
+        const marker = L.marker([r.loc.lat, r.loc.lng], { icon, title: r.label }).addTo(layerGroup);
+        const gmaps = `https://www.google.com/maps/search/?api=1&query=${r.loc.lat},${r.loc.lng}`;
+        const gmapsStation = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(r.station + '駅')}`;
+        marker.bindPopup(`
+          <div class="popup">
+            <strong>${r.station}駅</strong><br>
+            徒歩${r.minutes}分 / 半径${r.radius}m<br>
+            ${r.lines ? `<small>${r.lines}</small><br>` : ''}
+            <small>${r.loc.lat.toFixed(6)}, ${r.loc.lng.toFixed(6)}</small><br>
+            <a href="${gmaps}" target="_blank" rel="noopener">Google Mapsで座標を開く</a><br>
+            <a href="${gmapsStation}" target="_blank" rel="noopener">Google Mapsで駅を検索</a>
+          </div>
+        `);
+      });
+
+      if (bounds.isValid()) map.fitBounds(bounds, { padding: [40, 40] });
+      renderLegend(results);
+      setStatus(`${results.length}件の駅を表示しました。円の重なる範囲が条件を満たすエリアです。`);
+    } catch (e) {
+      console.error(e);
+      setStatus(e.message || String(e), true);
+    } finally {
+      $('run').disabled = false;
+    }
+  }
+
+  $('run').addEventListener('click', () => { updateUrl(); run(); });
+  $('input').addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { updateUrl(); run(); }
+  });
+
+  function updateUrl() {
+    const params = new URLSearchParams();
+    const q = $('input').value.trim();
+    const speed = $('speed').value;
+    if (q) params.set('q', q);
+    if (speed && speed !== '80') params.set('speed', speed);
+    const url = `${location.pathname}${params.toString() ? '?' + params.toString() : ''}`;
+    history.replaceState(null, '', url);
+  }
+
+  function loadFromUrl() {
+    const params = new URLSearchParams(location.search);
+    const q = params.get('q');
+    const speed = params.get('speed');
+    if (speed) $('speed').value = speed;
+    if (q) {
+      $('input').value = q;
+      run();
+    }
+  }
+
+  window.addEventListener('popstate', loadFromUrl);
+  loadFromUrl();
+})();
+</script>
+</body>
+</html>
