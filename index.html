@@ -71,58 +71,130 @@
     statusEl.classList.toggle('error', isError);
   }
 
+  // 「駅名」駅 (間にバス停などを含まない) 徒歩N分 のみ抽出
   function parseInput(text) {
     const entries = [];
-    const chunks = text.split(/[／/]/).map(s => s.trim()).filter(Boolean);
-    for (const chunk of chunks) {
-      const stationMatch = chunk.match(/[「『]([^」』]+)[」』]/);
-      const minutesMatch = chunk.match(/徒歩\s*(\d+)\s*分/);
-      if (!stationMatch || !minutesMatch) continue;
-      const station = stationMatch[1];
-      const minutes = parseInt(minutesMatch[1], 10);
-      const linesPart = chunk.slice(0, stationMatch.index).trim();
+    const re = /[「『]([^」』]+)[」』]\s*駅[^「『]*?徒歩\s*(\d+)\s*分/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const station = m[1];
+      const minutes = parseInt(m[2], 10);
+      // 路線名は直前の区切り(／/改行)からこの駅名までの文字列
+      const before = text.slice(0, m.index);
+      const lineMatch = before.match(/[^／/\n]*$/);
+      const lines = lineMatch ? lineMatch[0].trim() : null;
       entries.push({
         station,
         minutes,
-        lines: linesPart || null,
+        lines: lines || null,
         label: `${station}駅 徒歩${minutes}分`,
       });
     }
     return entries;
   }
 
-  // 日本のおおよその中心（バイアス用）
   const JP_CENTER = { lat: 36.2048, lng: 138.2529 };
 
-  async function geocode(query) {
-    const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=5&lang=default&lat=${JP_CENTER.lat}&lon=${JP_CENTER.lng}`;
-    const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
-    if (!res.ok) throw new Error(`Photon error: ${res.status}`);
-    const data = await res.json();
-    const features = data.features || [];
-    if (features.length === 0) return null;
-    // 日本国内を優先
-    const jp = features.find(f => f.properties && f.properties.countrycode === 'JP') || features[0];
-    const [lng, lat] = jp.geometry.coordinates;
-    return { lat, lng };
+  const normLine = s => (s || '').replace(/[\s・、,\-ー－‐]/g, '').replace(/線$/, '');
+
+  // HeartRails Express API: 日本の駅DB (駅名・路線・都道府県つき)
+  async function fetchFromHeartRails(stationName) {
+    try {
+      const url = `https://express.heartrails.com/api/json?method=getStations&name=${encodeURIComponent(stationName)}`;
+      const res = await fetch(url);
+      if (!res.ok) return [];
+      const data = await res.json();
+      const stations = data?.response?.station || [];
+      return stations.map(s => ({
+        lat: parseFloat(s.y),
+        lng: parseFloat(s.x),
+        props: { line: s.line, prefecture: s.prefecture, name: s.name, source: 'heartrails' },
+      }));
+    } catch (e) {
+      console.warn('HeartRails failed', e);
+      return [];
+    }
   }
 
-  async function geocodeStation(entry) {
-    const candidates = [
-      `${entry.station} station`,
-      `${entry.station}駅`,
-      `${entry.station} 駅`,
-      entry.station,
-    ];
-    for (const q of candidates) {
-      try {
-        const loc = await geocode(q);
-        if (loc) return loc;
-      } catch (e) {
-        console.warn(e);
+  async function fetchFromPhoton(query, limit = 8) {
+    try {
+      const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=${limit}&lat=${JP_CENTER.lat}&lon=${JP_CENTER.lng}`;
+      const res = await fetch(url);
+      if (!res.ok) return [];
+      const data = await res.json();
+      const features = (data.features || []).filter(f => f.properties && f.properties.countrycode === 'JP');
+      return features.map(f => ({
+        lat: f.geometry.coordinates[1],
+        lng: f.geometry.coordinates[0],
+        props: { ...f.properties, source: 'photon' },
+      }));
+    } catch (e) {
+      console.warn('Photon failed', e);
+      return [];
+    }
+  }
+
+  async function geocodeStationCandidates(entry) {
+    // 1. HeartRails (日本の駅DB) を優先: 路線名が一致する駅があればそれを候補にする
+    const hr = await fetchFromHeartRails(entry.station);
+    if (hr.length > 0) {
+      if (entry.lines) {
+        const hintNorm = normLine(entry.lines);
+        const hintTokens = entry.lines.split(/[・、,]/).map(normLine).filter(Boolean);
+        const matched = hr.filter(c => {
+          const lineNorm = normLine(c.props.line);
+          return hintTokens.some(t => t && (lineNorm.includes(t) || t.includes(lineNorm)))
+            || (hintNorm && (lineNorm.includes(hintNorm) || hintNorm.includes(lineNorm)));
+        });
+        if (matched.length > 0) return matched;
+      }
+      return hr;
+    }
+    // 2. Photon にフォールバック
+    const hints = [];
+    if (entry.lines) hints.push(`${entry.lines} ${entry.station}駅`);
+    hints.push(`${entry.station}駅`, `${entry.station} station`, entry.station);
+    const seen = new Set();
+    const all = [];
+    for (const q of hints) {
+      const cands = await fetchFromPhoton(q, 8);
+      for (const c of cands) {
+        const key = `${c.lat.toFixed(4)},${c.lng.toFixed(4)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        all.push(c);
+      }
+      if (all.length >= 8) break;
+    }
+    return all;
+  }
+
+  // 全駅候補の組み合わせから、駅同士の合計距離が最小になるものを選ぶ (同名駅の誤認識対策)
+  function pickBestCombination(candidatesPerEntry) {
+    if (candidatesPerEntry.some(c => c.length === 0)) return null;
+    let best = null;
+    let bestScore = Infinity;
+    const n = candidatesPerEntry.length;
+    function dfs(idx, pick) {
+      if (idx === n) {
+        if (n === 1) { best = [...pick]; return; }
+        let score = 0;
+        for (let i = 0; i < n; i++) {
+          for (let j = i + 1; j < n; j++) {
+            score += haversine(pick[i].lat, pick[i].lng, pick[j].lat, pick[j].lng);
+          }
+        }
+        if (score < bestScore) { bestScore = score; best = [...pick]; }
+        return;
+      }
+      for (const c of candidatesPerEntry[idx]) {
+        pick.push(c);
+        dfs(idx + 1, pick);
+        pick.pop();
       }
     }
-    return null;
+    dfs(0, []);
+    return best;
   }
 
   function ensureMap() {
@@ -228,14 +300,23 @@
       ensureMap();
       clearLayers();
 
-      const results = [];
+      const candidatesPerEntry = [];
       for (let i = 0; i < entries.length; i++) {
         const entry = entries[i];
-        setStatus(`駅を検索中... (${i + 1}/${entries.length}) ${entry.station}駅`);
-        const loc = await geocodeStation(entry);
-        if (!loc) throw new Error(`${entry.station}駅 が見つかりませんでした`);
-        results.push({ ...entry, loc, radius: entry.minutes * speed });
+        setStatus(`駅候補を検索中... (${i + 1}/${entries.length}) ${entry.station}駅`);
+        const cands = await geocodeStationCandidates(entry);
+        if (cands.length === 0) throw new Error(`${entry.station}駅 が見つかりませんでした`);
+        candidatesPerEntry.push(cands);
       }
+      const picked = pickBestCombination(candidatesPerEntry);
+      if (!picked) throw new Error('駅候補の組み合わせを決定できませんでした');
+
+      const results = entries.map((entry, i) => ({
+        ...entry,
+        loc: { lat: picked[i].lat, lng: picked[i].lng },
+        radius: entry.minutes * speed,
+        placeProps: picked[i].props,
+      }));
 
       const bounds = L.latLngBounds([]);
       results.forEach((r, i) => {
