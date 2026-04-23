@@ -116,9 +116,10 @@
     }
   }
 
-  async function fetchFromPhoton(query, limit = 8) {
+  async function fetchFromPhoton(query, { limit = 8, stationOnly = false } = {}) {
     try {
-      const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=${limit}&lat=${JP_CENTER.lat}&lon=${JP_CENTER.lng}`;
+      const tag = stationOnly ? '&osm_tag=railway:station' : '';
+      const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=${limit}&lat=${JP_CENTER.lat}&lon=${JP_CENTER.lng}${tag}`;
       const res = await fetch(url);
       if (!res.ok) return [];
       const data = await res.json();
@@ -134,8 +135,21 @@
     }
   }
 
+  function dedupeByCoord(candidates, limit = 8) {
+    const seen = new Set();
+    const out = [];
+    for (const c of candidates) {
+      const key = `${c.lat.toFixed(4)},${c.lng.toFixed(4)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(c);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
   async function geocodeStationCandidates(entry) {
-    // 1. HeartRails (日本の駅DB) を優先: 路線名が一致する駅があればそれを候補にする
+    // 1. HeartRails (日本の駅DB, 路線名つき) - 路線名が一致する駅を優先
     const hr = await fetchFromHeartRails(entry.station);
     if (hr.length > 0) {
       if (entry.lines) {
@@ -150,23 +164,26 @@
       }
       return hr;
     }
-    // 2. Photon にフォールバック
-    const hints = [];
-    if (entry.lines) hints.push(`${entry.lines} ${entry.station}駅`);
-    hints.push(`${entry.station}駅`, `${entry.station} station`, entry.station);
-    const seen = new Set();
+    // 2. Photon: railway:station タグに限定 (駅以外の同名地名を除外)
+    const stationOnlyCands = [];
+    const stationQueries = [`${entry.station}`, `${entry.station} station`, `${entry.station}駅`];
+    for (const q of stationQueries) {
+      const cs = await fetchFromPhoton(q, { limit: 8, stationOnly: true });
+      stationOnlyCands.push(...cs);
+      if (stationOnlyCands.length >= 8) break;
+    }
+    if (stationOnlyCands.length > 0) return dedupeByCoord(stationOnlyCands);
+    // 3. Photon: 最後のフォールバック (駅以外も含む)
     const all = [];
-    for (const q of hints) {
-      const cands = await fetchFromPhoton(q, 8);
-      for (const c of cands) {
-        const key = `${c.lat.toFixed(4)},${c.lng.toFixed(4)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        all.push(c);
-      }
+    const fallbackQueries = [];
+    if (entry.lines) fallbackQueries.push(`${entry.lines} ${entry.station}駅`);
+    fallbackQueries.push(`${entry.station}駅`, entry.station);
+    for (const q of fallbackQueries) {
+      const cs = await fetchFromPhoton(q, { limit: 8 });
+      all.push(...cs);
       if (all.length >= 8) break;
     }
-    return all;
+    return dedupeByCoord(all);
   }
 
   // 全駅候補の組み合わせから、駅同士の合計距離が最小になるものを選ぶ (同名駅の誤認識対策)
