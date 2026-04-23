@@ -45,7 +45,7 @@
     <div class="row">
       <label>徒歩速度: <input type="number" id="speed" value="80" min="40" max="120" step="10">m/分</label>
       <button id="run">表示</button>
-      <button id="openAllGmaps" type="button" disabled>Google Mapsで中心を開く</button>
+      <button id="openAllGmaps" type="button" disabled>重なり範囲をGoogle Mapsで開く</button>
       <span style="font-size:12px;color:#888">地図: OpenStreetMap / ジオコーディング: Photon</span>
     </div>
     <div id="status"></div>
@@ -154,10 +154,59 @@
     });
   }
 
-  function centerOf(results) {
-    const lat = results.reduce((s, r) => s + r.loc.lat, 0) / results.length;
-    const lng = results.reduce((s, r) => s + r.loc.lng, 0) / results.length;
-    return { lat, lng };
+  function haversine(lat1, lng1, lat2, lng2) {
+    const R = 6371000;
+    const toRad = d => d * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const a = Math.sin(dLat / 2) ** 2
+      + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+  }
+
+  // 全円の共通領域の「境界(端)」を返す: 各円の外周のうち他すべての円にも含まれる弧を集め、角度順に並べる
+  function overlapBoundary(results) {
+    if (results.length === 1) {
+      const r = results[0];
+      const ring = [];
+      const latRad = r.loc.lat * Math.PI / 180;
+      for (let k = 0; k < 360; k++) {
+        const angle = (k / 360) * 2 * Math.PI;
+        ring.push({
+          lat: r.loc.lat + (r.radius * Math.cos(angle)) / 111000,
+          lng: r.loc.lng + (r.radius * Math.sin(angle)) / (111000 * Math.cos(latRad)),
+        });
+      }
+      return { boundary: ring, center: { ...r.loc } };
+    }
+
+    const N = 720;
+    const TOL = 1; // 丸め誤差吸収 (m)
+    const boundary = [];
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const latRad = r.loc.lat * Math.PI / 180;
+      for (let k = 0; k < N; k++) {
+        const angle = (k / N) * 2 * Math.PI;
+        const lat = r.loc.lat + (r.radius * Math.cos(angle)) / 111000;
+        const lng = r.loc.lng + (r.radius * Math.sin(angle)) / (111000 * Math.cos(latRad));
+        let inside = true;
+        for (let j = 0; j < results.length; j++) {
+          if (j === i) continue;
+          if (haversine(lat, lng, results[j].loc.lat, results[j].loc.lng) > results[j].radius + TOL) {
+            inside = false;
+            break;
+          }
+        }
+        if (inside) boundary.push({ lat, lng });
+      }
+    }
+    if (boundary.length < 3) return null;
+
+    const cLat = boundary.reduce((s, p) => s + p.lat, 0) / boundary.length;
+    const cLng = boundary.reduce((s, p) => s + p.lng, 0) / boundary.length;
+    boundary.sort((a, b) => Math.atan2(a.lat - cLat, a.lng - cLng) - Math.atan2(b.lat - cLat, b.lng - cLng));
+    return { boundary, center: { lat: cLat, lng: cLng } };
   }
 
   function gmapsLink(lat, lng, label) {
@@ -225,14 +274,28 @@
       if (bounds.isValid()) map.fitBounds(bounds, { padding: [40, 40] });
       renderLegend(results);
 
-      const center = centerOf(results);
+      const overlap = overlapBoundary(results);
       const openBtn = $('openAllGmaps');
-      openBtn.disabled = false;
-      openBtn.onclick = () => {
-        window.open(`https://www.google.com/maps/@${center.lat},${center.lng},15z`, '_blank', 'noopener');
-      };
+      if (overlap) {
+        const poly = L.polygon(
+          overlap.boundary.map(p => [p.lat, p.lng]),
+          { color: '#000', weight: 2, fillColor: '#ffeb3b', fillOpacity: 0.35, dashArray: '4,4' }
+        ).addTo(layerGroup);
+        poly.bringToFront();
 
-      setStatus(`${results.length}件の駅を表示しました。円の重なる範囲が条件を満たすエリアです。凡例の駅名クリックでGoogle Mapsが開きます。`);
+        const c = overlap.center;
+        const gmaps = `https://www.google.com/maps/search/?api=1&query=${c.lat},${c.lng}`;
+        poly.bindPopup(`<strong>全条件を満たす範囲</strong><br><small>中心: ${c.lat.toFixed(6)}, ${c.lng.toFixed(6)}</small><br><a href="${gmaps}" target="_blank" rel="noopener">Google Mapsで中心を開く</a>`);
+
+        openBtn.disabled = false;
+        openBtn.textContent = '重なり範囲をGoogle Mapsで開く';
+        openBtn.onclick = () => window.open(gmaps, '_blank', 'noopener');
+        setStatus(`${results.length}件の駅を表示しました。黄色の領域が全条件を満たす重なり範囲です。`);
+      } else {
+        openBtn.disabled = true;
+        openBtn.textContent = '重なり範囲なし';
+        setStatus(`${results.length}件の駅を表示しました。すべての条件を満たす範囲は存在しません。`);
+      }
     } catch (e) {
       console.error(e);
       setStatus(e.message || String(e), true);
